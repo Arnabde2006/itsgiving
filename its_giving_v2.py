@@ -9,7 +9,7 @@ Seven seconds of calibration; see README.md.
   python its_giving_v2.py --calibrate
   python its_giving_v2.py [--camera 1] [--no-vcam] [--size 640x480] [--no-flip]
 
-Keys:  q quit   d toggle HUD   c recalibrate   1-9 0 - = [ ] force-show a pose
+Keys:  q quit   d toggle HUD   c recalibrate   1-9 0 - = [ ] w e r  force-show a pose
 """
 import argparse
 import json
@@ -26,37 +26,45 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_tasks
 from mediapipe.tasks.python import vision
 
+# NOTE: order matters — TEST_KEYS below maps 1:1 to this list by position.
 POSES = ["time_out", "heart", "cover_nose", "crashing_out", "dance", "nose_closed", "flirty", "hand_up",
-         "tongue_out", "open_mouth", "disgusted", "talking_to_wall", "suspicious", "spin"]
-TEST_KEYS = "1234567890-=[]"
+         "tongue_out", "open_mouth", "disgusted", "talking_to_wall", "suspicious", "spin",
+         "wink", "kurty", "pouring"]
+# 14 original poses use 1234567890-=[]  ; the 3 new poses use w e r
+TEST_KEYS = "1234567890-=[]wer"
 
 FACE_SCALE = 2.0
 HOLD_FRAMES = 10
 ARM = {
-    "spin": 15, "suspicious": 8, "talking_to_wall": 6, "dance": 6, "crashing_out": 4,
-    "open_mouth": 4, "tongue_out": 5, "disgusted": 5,
+    "spin": 15, "suspicious": 6, "talking_to_wall": 5, "dance": 5, "crashing_out": 4,
+    "open_mouth": 3, "tongue_out": 4, "disgusted": 4,
+    "wink": 3, "kurty": 4, "pouring": 4,
 }
 
+# Lowered from the original defaults so expressions trigger more easily.
 Z = dict(
-    jaw_open=6.0,
-    scream_jaw=3.5,
-    tongue_jaw=3.5,
-    sneer=4.5,
-    disgust=14.0,
-    squint=4.0,
+    jaw_open=4.5,      # was 6.0
+    scream_jaw=2.5,    # was 3.5
+    tongue_jaw=2.5,    # was 3.5
+    sneer=3.0,         # was 4.5
+    disgust=10.0,      # was 14.0
+    squint=3.0,        # was 4.0
+    pouring=3.0,       # new: how "intense/surprised" for the pouring pose
 )
 Z_CAP = 8.0
 FLOOR = dict(
-    jaw_open=0.30,
-    scream_jaw=0.18,
-    tongue_jaw=0.18,
-    sneer=0.06,
-    squint=0.18,
+    jaw_open=0.24,     # was 0.30
+    scream_jaw=0.14,   # was 0.18
+    tongue_jaw=0.14,   # was 0.18
+    sneer=0.05,        # was 0.06
+    squint=0.14,       # was 0.18
 )
 T = dict(
     tongue=0.5,
     head_turn=0.15,
     gesture=0.035,
+    wink_on=0.55,      # was implicitly 0.6 in the added logic
+    wink_off=0.25,     # the other eye must stay below this
 )
 
 CALIB_FILE = "calibration.json"
@@ -487,9 +495,14 @@ def measure(face, base):
         "squint": max(pair("eyeSquint"), pair("eyeBlink")),
         "z_squint": max(zpair("eyeSquint"), zpair("eyeBlink")),
         "turn": abs(face.turn_signed - base.neutral_turn),
+        "blink_l": face.b("eyeBlinkLeft"), "blink_r": face.b("eyeBlinkRight"),
+        "brow_up": max(face.b("browInnerUp"), face.b("browOuterUpLeft"), face.b("browOuterUpRight")),
     }
     cap = lambda v: min(v, Z_CAP)
     m["z_disgust"] = 2 * cap(m["z_sneer"]) + cap(m["z_brow"]) + cap(m["z_frown"]) + cap(m["z_lip"])
+    # "pouring" reuses the disgust/scream signal but weighted toward wide eyes + open mouth,
+    # for a shocked/intense look rather than a sneer.
+    m["z_pouring"] = cap(m["z_jaw"]) + cap(m["z_brow"])
     return m
 
 
@@ -510,6 +523,12 @@ def decide(face, hands, body, tongue, gesture, m):
     elbows_up = bool(body and body.elbows_up)
     d.update(m, gesture=gesture, tongue=tongue, elbows_up=elbows_up)
     screaming = over("scream_jaw", m, "z_jaw", "jaw")
+
+    # --- wink: one eye clearly closed, the other clearly open ---
+    if m["blink_l"] > T["wink_on"] and m["blink_r"] < T["wink_off"]:
+        return "wink", d
+    if m["blink_r"] > T["wink_on"] and m["blink_l"] < T["wink_off"]:
+        return "wink", d
 
     if len(hands) >= 2:
         a, b = hands[0], hands[1]
@@ -538,11 +557,19 @@ def decide(face, hands, body, tongue, gesture, m):
             return "flirty", d
         if h.open and h.palm[1] < face.nose[1] and abs(h.palm[0] - face.nose[0]) > 0.8 * fw:
             return "hand_up", d
+        # --- kurty: one hand raised near the face (not touching it) while jaw is moving/open,
+        #     as if mid-rant/pointing while talking ---
+        if near(h.palm, face.nose, 1.0) and not near(h.palm, face.mouth, 0.35) \
+                and h.palm[1] < face.mouth[1] and (m["jaw"] > 0.12 or gesture > T["gesture"]):
+            return "kurty", d
 
     if tongue > T["tongue"]:
         return "tongue_out", d
     if over("jaw_open", m, "z_jaw", "jaw"):
         return "open_mouth", d
+    # --- pouring: wide eyes + open mouth + raised brows, a shocked/intense look, no hands needed ---
+    if not hands and m["z_pouring"] >= Z["pouring"] and m["jaw"] >= FLOOR["jaw_open"] * 0.6:
+        return "pouring", d
     if over("sneer", m, "z_sneer", "sneer") or m["z_disgust"] >= Z["disgust"]:
         return "disgusted", d
     if hands and gesture > T["gesture"]:
@@ -570,11 +597,13 @@ def draw_hud(img, shown, raw, d, face, hands, body, base):
          f"tongue {g('tongue', 0):.2f}   turn {g('turn', 0):.2f}   gesture {g('gesture', 0):.3f}", (0, 255, 0)),
         (f"disgust {g('z_disgust', 0):+.1f}s/{Z['disgust']:.0f} = 2x sneer {g('z_sneer', 0):+.1f} "
          f"+ brow {g('z_brow', 0):+.1f} + frown {g('z_frown', 0):+.1f} + lip {g('z_lip', 0):+.1f}", (0, 255, 0)),
+        (f"pouring {g('z_pouring', 0):+.1f}s/{Z['pouring']:.0f}   "
+         f"blink L {g('blink_l', 0):.2f} R {g('blink_r', 0):.2f}", (0, 255, 0)),
         (("NOT CALIBRATED - generic baseline, everything is harder to trigger. press 'c'"
           if base.generic else
           f"calibrated {base.made} on {base.samples} frames   (s = sigma above your neutral)"),
          (0, 140, 255) if base.generic else (200, 200, 200)),
-        ("keys: q quit  d hud  c recalibrate  1-9 0 - = [ ] test poses", (0, 255, 0)),
+        ("keys: q quit  d hud  c recalibrate  1-9 0 - = [ ] w e r  test poses", (0, 255, 0)),
     ]
     for i, (t, colour) in enumerate(lines):
         y = 24 + 22 * i
@@ -622,7 +651,7 @@ def main():
     print(f"Camera {args.camera}: {W}x{H}")
 
     clock = Clock()
-    window = "it's giving v2  (q quit, d HUD, c recalibrate, 1-9 0 - = [ ] test)"
+    window = "it's giving v2  (q quit, d HUD, c recalibrate, 1-9 0 - = [ ] w e r  test)"
 
     if args.calibrate:
         face_det = vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
@@ -659,7 +688,7 @@ def main():
     shown_since = 0.0
     forced, forced_until = None, 0.0
     sm_center, sm_h = np.array([W / 2, H / 2], np.float32), H * 0.45
-    print("Running. Focus the preview window: q quit, d HUD, c recalibrate, 1-9 0 - = [ ] test a pose")
+    print("Running. Focus the preview window: q quit, d HUD, c recalibrate, 1-9 0 - = [ ] w e r  test a pose")
 
     try:
         while True:
